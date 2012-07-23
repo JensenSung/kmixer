@@ -51,6 +51,8 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 #include "kmixervar.h"
 
+#define KMIXER_BUFSIZE	AU_RING_SIZE
+
 static int	kmixer_attach(void);
 static int	kmixer_detach(void);
 
@@ -59,6 +61,9 @@ static void	kmixer_add_hw(struct kmixer_softc *, device_t);
 static void	kmixer_del_hw(struct kmixer_softc *, device_t);
 static void	kmixer_select_hw(struct kmixer_softc *);
 static void	kmixer_devicehook(void *, device_t, int);
+
+static struct kmixer_ch * kmixer_alloc_chan(struct kmixer_softc *);
+static void	kmixer_free_chan(struct kmixer_ch *);
 
 dev_type_open(kmixer_open);
 
@@ -76,7 +81,6 @@ const struct cdevsw kmixer_cdevsw = {
 	.d_flag = D_OTHER,
 };
 
-#if notyet
 static int	kmixer_chan_read(struct file *, off_t *, struct uio *,
 				 kauth_cred_t, int);
 static int	kmixer_chan_write(struct file *, off_t *, struct uio *,
@@ -94,9 +98,7 @@ static const struct fileops kmixer_fileops = {
 	.fo_stat = fbadop_stat,
 	.fo_close = kmixer_chan_close,
 	.fo_kqfilter = fnullop_kqfilter,
-	.fo_drain = fnullop_drain,
 };
-#endif
 
 extern const struct cdevsw audio_cdevsw;
 
@@ -113,9 +115,10 @@ kmixer_attach(void)
 		return ENOMEM;
 	}
 
-	cv_init(&sc->sc_condvar, "kmixer");
+	cv_init(&sc->sc_cv, "kmixer");
 	mutex_init(&sc->sc_lock, MUTEX_DEFAULT, IPL_NONE);
 	TAILQ_INIT(&sc->sc_hw);
+	TAILQ_INIT(&sc->sc_ch);
 
 	mutex_enter(&sc->sc_lock);
 	kmixer_enum_hw(sc);
@@ -139,7 +142,7 @@ kmixer_detach(void)
 	vdevgone(cmaj, mn, mn, VCHR);
 
 	mutex_destroy(&sc->sc_lock);
-	cv_destroy(&sc->sc_condvar);
+	cv_destroy(&sc->sc_cv);
 
 	while (!TAILQ_EMPTY(&sc->sc_hw)) {
 		hw = TAILQ_FIRST(&sc->sc_hw);
@@ -156,9 +159,8 @@ kmixer_detach(void)
 int
 kmixer_open(dev_t dev, int flags, int fmt, struct lwp *l)
 {
-#if notyet
 	struct kmixer_softc *sc = kmixer_softc;
-	struct kmixer_chan *ch;
+	struct kmixer_ch *ch;
 	struct file *fp;
 	int err, fd;
 
@@ -176,9 +178,6 @@ kmixer_open(dev_t dev, int flags, int fmt, struct lwp *l)
 	}
 
 	return fd_clone(fp, fd, flags, &kmixer_fileops, ch);
-#else
-	return ENXIO;
-#endif
 }
 
 static const char *
@@ -325,6 +324,88 @@ kmixer_devicehook(void *arg, device_t dev, int event)
 
 	mutex_exit(&sc->sc_lock);
 
+}
+
+static struct kmixer_ch *
+kmixer_alloc_chan(struct kmixer_softc *sc)
+{
+	struct kmixer_ch *ch;
+
+	ch = kmem_zalloc(sizeof(*ch), KM_SLEEP);
+	if (ch == NULL)
+		return NULL;
+
+	ch->ch_softc = sc;
+	cv_init(&ch->ch_cv, "kmixerch");
+	mutex_init(&ch->ch_lock, MUTEX_DEFAULT, IPL_AUDIO);
+
+	mutex_enter(&sc->sc_lock);
+	TAILQ_INSERT_TAIL(&sc->sc_ch, ch, ch_entry);
+	mutex_exit(&sc->sc_lock);
+
+	return ch;
+}
+
+static void
+kmixer_free_chan(struct kmixer_ch *ch)
+{
+	struct kmixer_softc *sc = ch->ch_softc;
+
+	mutex_enter(&sc->sc_lock);
+	TAILQ_REMOVE(&sc->sc_ch, ch, ch_entry);
+	mutex_exit(&sc->sc_lock);
+
+	mutex_destroy(&ch->ch_lock);
+	cv_destroy(&ch->ch_cv);
+	kmem_free(ch, sizeof(*ch));
+}
+
+static int
+kmixer_chan_read(struct file *fp, off_t *offp, struct uio *uio,
+    kauth_cred_t cred, int flags)
+{
+	return EIO;	/* TODO */
+}
+
+static int
+kmixer_chan_write(struct file *fp, off_t *offp, struct uio *uio,
+    kauth_cred_t cred, int flags)
+{
+	struct kmixer_ch *ch = fp->f_data;
+	//struct kmixer_softc *sc = ch->ch_softc;
+
+	if (uio->uio_resid == 0)
+		return 0;
+
+	mutex_enter(&ch->ch_lock);
+	while (uio->uio_resid > 0) {
+		
+	}
+	mutex_exit(&ch->ch_lock);
+
+	return 0;
+}
+
+static int
+kmixer_chan_ioctl(struct file *fp, u_long cmd, void *data)
+{
+	return ENXIO;	/* TODO */
+}
+
+static int
+kmixer_chan_poll(struct file *fp, int events)
+{
+	return 0;	/* TODO */
+}
+
+static int
+kmixer_chan_close(struct file *fp)
+{
+	struct kmixer_ch *ch = fp->f_data;
+
+	kmixer_free_chan(ch);
+
+	return 0;
 }
 
 MODULE(MODULE_CLASS_DRIVER, kmixer, NULL);

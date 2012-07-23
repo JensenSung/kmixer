@@ -31,20 +31,38 @@
 
 struct kmixer_softc;
 
+/* hardware state */
 struct kmixer_hw {
 	device_t		hw_dev;
 	TAILQ_ENTRY(kmixer_hw)	hw_entry;
 };
 TAILQ_HEAD(kmixer_hw_list, kmixer_hw);
 
+/* channel state */
+struct kmixer_ch {
+	kmutex_t		ch_lock;
+	kcondvar_t		ch_cv;
+	struct kmixer_softc	*ch_softc;
+
+	audio_params_t		ch_pparams;
+
+	TAILQ_ENTRY(kmixer_ch) ch_entry;
+};
+TAILQ_HEAD(kmixer_ch_list, kmixer_ch);
+
+/* kmixer state */
 struct kmixer_softc {
-	void			*sc_hook;
-
-	kcondvar_t		sc_condvar;
 	kmutex_t		sc_lock;
+	kcondvar_t		sc_cv;
 
-	struct kmixer_hw_list	sc_hw;
-	struct kmixer_hw	*sc_selhw;
+	struct kmixer_hw_list	sc_hw;		/* hardware list */
+	struct kmixer_hw	*sc_selhw;	/* selected hw device */
+
+	struct kmixer_ch_list	sc_ch;		/* channel list */
+
+	void			*sc_hook;	/* devicehook handle */
+
+	struct audio_softc	sc_audiosc;	/* fake audio softc */
 };
 
 #endif /* !_KMIXERVAR_H */
