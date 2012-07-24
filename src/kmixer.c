@@ -51,6 +51,10 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 #include "kmixervar.h"
 
+#ifndef KMIXER_SAMPLE_RATE
+#define KMIXER_SAMPLE_RATE	48000
+#endif
+
 #define KMIXER_BUFSIZE	AU_RING_SIZE
 
 static int	kmixer_attach(void);
@@ -60,6 +64,8 @@ static void	kmixer_enum_hw(struct kmixer_softc *);
 static void	kmixer_add_hw(struct kmixer_softc *, device_t);
 static void	kmixer_del_hw(struct kmixer_softc *, device_t);
 static void	kmixer_select_hw(struct kmixer_softc *);
+static int	kmixer_open_hw(struct kmixer_softc *, struct kmixer_hw *);
+static void	kmixer_close_hw(struct kmixer_softc *, struct kmixer_hw *);
 static void	kmixer_devicehook(void *, device_t, int);
 
 static struct kmixer_ch * kmixer_alloc_chan(struct kmixer_softc *);
@@ -100,6 +106,22 @@ static const struct fileops kmixer_fileops = {
 	.fo_kqfilter = fnullop_kqfilter,
 };
 
+static const struct audio_params kmixer_hw_default = {
+	.sample_rate = KMIXER_SAMPLE_RATE,
+	.encoding = AUDIO_ENCODING_SLINEAR_LE,
+	.precision = 16,
+	.validbits = 16,
+	.channels = 2,
+};
+
+static const struct audio_params kmixer_ch_default = {
+	.sample_rate = 8000,
+	.encoding = AUDIO_ENCODING_ULAW,
+	.precision = 8,
+	.validbits = 8,
+	.channels = 1,
+};
+
 extern const struct cdevsw audio_cdevsw;
 
 static struct kmixer_softc *kmixer_softc = NULL;
@@ -118,7 +140,7 @@ kmixer_attach(void)
 	cv_init(&sc->sc_cv, "kmixer");
 	mutex_init(&sc->sc_lock, MUTEX_DEFAULT, IPL_NONE);
 	TAILQ_INIT(&sc->sc_hw);
-	TAILQ_INIT(&sc->sc_ch);
+	TAILQ_INIT(&sc->sc_inact_ch);
 
 	mutex_enter(&sc->sc_lock);
 	kmixer_enum_hw(sc);
@@ -148,7 +170,7 @@ kmixer_detach(void)
 		hw = TAILQ_FIRST(&sc->sc_hw);
 		kmixer_del_hw(sc, hw->hw_dev);
 	}
-	kmixer_select_hw(sc);	/* cosmetic */
+	kmixer_select_hw(sc);
 
 	kmem_free(sc, sizeof(*sc));
 	kmixer_softc = NULL;
@@ -212,11 +234,20 @@ kmixer_add_hw(struct kmixer_softc *sc, device_t hw_dev)
 {
 	struct kmixer_hw *hw;
 	device_t pdev, ppdev;
+	int mj, mn;
 
 	KASSERT(mutex_owned(&sc->sc_lock));
 
+	mj = cdevsw_lookup_major(&audio_cdevsw);
+	if (mj == -1) {
+		printf("kmixer: couldn't lookup audio major\n");
+		return;
+	}
+	mn = device_unit(hw_dev) + SOUND_DEVICE;
+
 	hw = kmem_alloc(sizeof(*hw), KM_SLEEP);
 	hw->hw_dev = hw_dev;
+	hw->hw_audiodev = makedev(mj, mn);
 
 	pdev = device_parent(hw_dev);
 	ppdev = device_parent(pdev);
@@ -274,6 +305,7 @@ kmixer_select_hw(struct kmixer_softc *sc)
 
 	KASSERT(mutex_owned(&sc->sc_lock));
 
+	/* find preferred default output device */
 	for (n = 0; new_hw == NULL && n < __arraycount(bus_pref); n++) {
 		TAILQ_FOREACH(hw, &sc->sc_hw, hw_entry) {
 			device_t pdev, ppdev;
@@ -288,6 +320,7 @@ kmixer_select_hw(struct kmixer_softc *sc)
 	if (new_hw == NULL)
 		new_hw = TAILQ_FIRST(&sc->sc_hw);
 
+	/* select a new preferred default output device */
 	if (new_hw != sc->sc_selhw) {
 		sc->sc_selhw = new_hw;
 		if (sc->sc_selhw) {
@@ -298,6 +331,57 @@ kmixer_select_hw(struct kmixer_softc *sc)
 		} else {
 			printf("kmixer: selected dev \"<none>\"\n");
 		}
+	}
+}
+
+static int
+kmixer_open_hw(struct kmixer_softc *sc, struct kmixer_hw *hw)
+{
+	struct audio_info ai;
+	int err;
+
+	KASSERT(mutex_owned(&sc->sc_lock));
+
+	if (hw == NULL)
+		return ENODEV;
+
+	if (!TAILQ_EMPTY(&hw->hw_act_ch))
+		return 0;
+
+	err = cdev_open(hw->hw_audiodev, FREAD|FWRITE, 0, &lwp0);
+	if (err) {
+		return err;
+	}
+
+	AUDIO_INITINFO(&ai);
+	ai.play.sample_rate = kmixer_hw_default.sample_rate;
+	ai.play.channels = kmixer_hw_default.channels;
+	ai.play.precision = kmixer_hw_default.precision;
+	ai.play.encoding = kmixer_hw_default.encoding;
+	ai.record.sample_rate = kmixer_hw_default.sample_rate;
+	ai.record.channels = kmixer_hw_default.channels;
+	ai.record.precision = kmixer_hw_default.precision;
+	ai.record.encoding = kmixer_hw_default.encoding;
+	ai.mode = AUMODE_PLAY | AUMODE_RECORD;
+	err = cdev_ioctl(hw->hw_audiodev, AUDIO_SETINFO, &ai,
+	    FREAD|FWRITE, &lwp0);
+	if (err)
+		goto fail;
+
+	return 0;
+
+fail:
+	cdev_close(hw->hw_audiodev, FREAD|FWRITE, 0, &lwp0);
+	return err;
+}
+
+static void
+kmixer_close_hw(struct kmixer_softc *sc, struct kmixer_hw *hw)
+{
+	KASSERT(mutex_owned(&sc->sc_lock));
+
+	if (TAILQ_EMPTY(&hw->hw_act_ch)) {
+		cdev_close(hw->hw_audiodev, FREAD|FWRITE, 0, &lwp0);
 	}
 }
 
@@ -330,6 +414,7 @@ static struct kmixer_ch *
 kmixer_alloc_chan(struct kmixer_softc *sc)
 {
 	struct kmixer_ch *ch;
+	int err;
 
 	ch = kmem_zalloc(sizeof(*ch), KM_SLEEP);
 	if (ch == NULL)
@@ -338,10 +423,26 @@ kmixer_alloc_chan(struct kmixer_softc *sc)
 	ch->ch_softc = sc;
 	cv_init(&ch->ch_cv, "kmixerch");
 	mutex_init(&ch->ch_lock, MUTEX_DEFAULT, IPL_AUDIO);
+	ch->ch_pparams = kmixer_ch_default;
 
 	mutex_enter(&sc->sc_lock);
-	TAILQ_INSERT_TAIL(&sc->sc_ch, ch, ch_entry);
+	if (sc->sc_selhw) {
+		err = kmixer_open_hw(sc, sc->sc_selhw);
+		if (err == 0) {
+			ch->ch_selhw = sc->sc_selhw;
+			TAILQ_INSERT_TAIL(&ch->ch_selhw->hw_act_ch,
+			    ch, ch_entry);
+		}
+	}
+	if (ch->ch_selhw == NULL) {
+		TAILQ_INSERT_TAIL(&sc->sc_inact_ch, ch, ch_entry);
+	}
 	mutex_exit(&sc->sc_lock);
+
+	if (err) {
+		kmem_free(ch, sizeof(*ch));
+		ch = NULL;
+	}
 
 	return ch;
 }
@@ -352,7 +453,12 @@ kmixer_free_chan(struct kmixer_ch *ch)
 	struct kmixer_softc *sc = ch->ch_softc;
 
 	mutex_enter(&sc->sc_lock);
-	TAILQ_REMOVE(&sc->sc_ch, ch, ch_entry);
+	if (ch->ch_selhw) {
+		TAILQ_REMOVE(&ch->ch_selhw->hw_act_ch, ch, ch_entry);
+		kmixer_close_hw(sc, ch->ch_selhw);
+	} else {
+		TAILQ_REMOVE(&sc->sc_inact_ch, ch, ch_entry);
+	}
 	mutex_exit(&sc->sc_lock);
 
 	mutex_destroy(&ch->ch_lock);
